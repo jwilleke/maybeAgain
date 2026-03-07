@@ -63,19 +63,39 @@ Only proceed with pull request creation if ALL checks pass.
 - Do not run `rails credentials`
 - Do not automatically run migrations
 
+## Tech Stack
+
+- **Web**: Ruby on Rails, Hotwire (Turbo + Stimulus), TailwindCSS v4, Propshaft asset pipeline
+- **Database**: PostgreSQL (see `db/schema.rb` as source of truth for relationships)
+- **Jobs**: Sidekiq + Redis
+- **Frontend**: D3.js for charts, Lucide Icons (via `icon` helper only), ViewComponents
+- **External**: Plaid (bank sync), Stripe (payments), Synth (market data / exchange rates), OpenAI (AI chat)
+
 ## High-Level Architecture
 
 ### Application Modes
 The Maybe app runs in two distinct modes:
-- **Managed**: The Maybe team operates and manages servers for users (Rails.application.config.app_mode = "managed")
-- **Self Hosted**: Users host the Maybe app on their own infrastructure, typically through Docker Compose (Rails.application.config.app_mode = "self_hosted")
+- **Managed**: The Maybe team operates and manages servers for users (`Rails.application.config.app_mode = "managed"`)
+- **Self Hosted**: Users host the Maybe app on their own infrastructure, typically through Docker Compose (`Rails.application.config.app_mode = "self_hosted"`)
 
 ### Core Domain Model
-The application is built around financial data management with these key relationships:
-- **User** → has many **Accounts** → has many **Transactions**
-- **Account** types: checking, savings, credit cards, investments, crypto, loans, properties
-- **Transaction** → belongs to **Category**, can have **Tags** and **Rules**
-- **Investment accounts** → have **Holdings** → track **Securities** via **Trades**
+
+`Family` is the primary owner of all financial data and Stripe subscriptions. `User` belongs to a `Family` and has a role of `admin` or `member`. Use `Current.family` / `Current.user`, never `current_family` / `current_user`.
+
+**Account** is a Rails delegated type. Each account subtype has its own DB table:
+- Asset accountables: `Depository`, `Investment`, `Crypto`, `Property`, `Vehicle`, `OtherAsset`
+- Liability accountables: `CreditCard`, `Loan`, `OtherLiability`
+
+**Entry** is also a delegated type representing anything that modifies an account's balance. Entry subtypes:
+- `Valuation` — sets the absolute balance of an account on a date
+- `Transaction` — income or expense that changes balance by `amount`
+- `Trade` — buy/sell of a holding (investment accounts only), has `qty` and `price`
+
+**Entry amount sign convention** (critical): A _negative_ amount is an **inflow** (money coming in); a _positive_ amount is an **outflow** (money going out).
+
+**Transfer**: Links two `Transaction` entries between accounts. Auto-matched when entries are from different accounts, within 4 days, same currency, and opposite values. Regular transfers are excluded from income/expense calculations; debt payments (to `Loan` accounts) are counted as expenses.
+
+**Holdings**: `Investment` accounts have `Holding` records — `qty` of a `Security` at a `price` on a `date`.
 
 ### API Architecture
 The application provides both internal and external APIs:
@@ -87,13 +107,15 @@ The application provides both internal and external APIs:
 ### Sync & Import System
 Two primary data ingestion methods:
 1. **Plaid Integration**: Real-time bank account syncing
-   - `PlaidItem` manages connections
-   - `Sync` tracks sync operations
-   - Background jobs handle data updates
+   - `PlaidItem` manages connections; `PlaidAccount` maps 1:1 to a Maybe `Account`
+   - Plaid sync is an ETL: fetch from Plaid → normalize → store on internal models → trigger Account sync
+   - `Sync` record tracks status/errors for each sync operation
 2. **CSV Import**: Manual data import with mapping
    - `Import` manages import sessions
    - Supports transaction and balance imports
    - Custom field mapping with transformation rules
+
+**Sync hierarchy**: `Family` sync (daily, auto via `AutoSync` concern) → `PlaidItem` syncs → `Account` syncs. An Account sync also triggers on every `Entry` update: auto-matches transfers, recalculates daily `Balance` records, and enriches transactions.
 
 ### Background Processing
 Sidekiq handles asynchronous tasks:
@@ -114,10 +136,13 @@ Sidekiq handles asynchronous tasks:
   - Use `icon` helper for icons, never `lucide_icon` directly
 
 ### Multi-Currency Support
-- All monetary values stored in base currency (user's primary currency)
+- All monetary values stored in base currency (family's primary currency)
 - Exchange rates fetched from Synth API
 - `Money` objects handle currency conversion and formatting
 - Historical exchange rates for accurate reporting
+
+### Data Provider Pattern
+Third-party data is optional for self-hosted users. Providers are resolved at runtime via `Provider::Registry`. Domain models access providers through a `Provided` concern within their namespace (e.g., `ExchangeRate::Provided`) rather than calling the registry directly. Generic data (exchange rates, security prices) uses a "concept" interface in `app/models/provider/concepts/`; provider implementations live under `Provider::` and wrap responses in `with_provider_response`.
 
 ### Security & Authentication
 - Session-based auth for web users

@@ -5,8 +5,11 @@ module Security::Provided
 
   class_methods do
     def provider
+      provider_name = (ENV["SECURITY_PROVIDER"].presence || "synth").to_sym
       registry = Provider::Registry.for_concept(:securities)
-      registry.get_provider(:synth)
+      registry.get_provider(provider_name)
+    rescue Provider::Registry::Error
+      nil
     end
 
     def search_provider(symbol, country_code: nil, exchange_operating_mic: nil)
